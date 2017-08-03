@@ -23,6 +23,7 @@ import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
+import io.lettuce.core.codec.RedisCodec;
 import io.lettuce.core.resource.ClientResources;
 
 import java.time.Duration;
@@ -82,6 +83,8 @@ public class LettuceConnectionFactory
 	private final LettuceClientConfiguration clientConfiguration;
 
 	private AbstractRedisClient client;
+	private LettuceConnectionProvider connectionProvider;
+	private LettuceConnectionProvider reactiveConnectionProvider;
 	private boolean validateConnection = false;
 	private boolean shareNativeConnection = true;
 	private StatefulRedisConnection<byte[], byte[]> connection;
@@ -213,7 +216,18 @@ public class LettuceConnectionFactory
 	 * @see org.springframework.beans.factory.InitializingBean#afterPropertiesSet()
 	 */
 	public void afterPropertiesSet() {
-		this.client = createRedisClient();
+
+		this.client = createClient();
+
+		this.connectionProvider = createConnectionProvider(client, LettuceConnection.CODEC);
+		this.reactiveConnectionProvider = createConnectionProvider(client, LettuceReactiveRedisConnection.CODEC);
+
+		if (isClusterAware()) {
+			this.clusterCommandExecutor = new ClusterCommandExecutor(
+					new LettuceClusterTopologyProvider((RedisClusterClient) client),
+					new LettuceClusterConnection.LettuceClusterNodeResourceProvider(this.connectionProvider),
+					EXCEPTION_TRANSLATION);
+		}
 	}
 
 	/*
@@ -223,6 +237,17 @@ public class LettuceConnectionFactory
 	public void destroy() {
 
 		resetConnection();
+
+		if (connectionProvider instanceof DisposableBean) {
+			try {
+				((DisposableBean) connectionProvider).destroy();
+			} catch (Exception e) {
+
+				if (log.isWarnEnabled()) {
+					log.warn(connectionProvider + " did not shut down gracefully.", e);
+				}
+			}
+		}
 
 		try {
 			Duration timeout = clientConfiguration.getShutdownTimeout();
@@ -255,8 +280,14 @@ public class LettuceConnectionFactory
 			return getClusterConnection();
 		}
 
-		LettuceConnection connection = new LettuceConnection(getSharedConnection(), getTimeout(), client, pool,
-				getDatabase());
+		LettuceConnection connection;
+		if (pool != null) {
+
+			connection = new LettuceConnection(getSharedConnection(), getTimeout(), null, pool, getDatabase());
+		} else {
+			connection = new LettuceConnection(getSharedConnection(), connectionProvider, getTimeout(), getDatabase());
+		}
+
 		connection.setConvertPipelineAndTxResults(convertPipelineAndTxResults);
 		return connection;
 	}
@@ -272,7 +303,7 @@ public class LettuceConnectionFactory
 			throw new InvalidDataAccessApiUsageException("Cluster is not configured!");
 		}
 
-		return new LettuceClusterConnection((RedisClusterClient) client, clusterCommandExecutor);
+		return new LettuceClusterConnection(connectionProvider, clusterCommandExecutor);
 	}
 
 	/*
@@ -281,7 +312,7 @@ public class LettuceConnectionFactory
 	 */
 	@Override
 	public LettuceReactiveRedisConnection getReactiveConnection() {
-		return new LettuceReactiveRedisConnection(client);
+		return new LettuceReactiveRedisConnection(reactiveConnectionProvider);
 	}
 
 	/*
@@ -294,7 +325,7 @@ public class LettuceConnectionFactory
 			throw new InvalidDataAccessApiUsageException("Cluster is not configured!");
 		}
 
-		return new LettuceReactiveRedisClusterConnection((RedisClusterClient) client);
+		return new LettuceReactiveRedisClusterConnection(reactiveConnectionProvider);
 	}
 
 	public void initConnection() {
@@ -313,7 +344,7 @@ public class LettuceConnectionFactory
 	public void resetConnection() {
 		synchronized (this.connectionMonitor) {
 			if (this.connection != null) {
-				this.connection.close();
+				this.connectionProvider.release(this.connection);
 			}
 			this.connection = null;
 		}
@@ -337,6 +368,8 @@ public class LettuceConnectionFactory
 			}
 
 			if (!valid) {
+
+				connectionProvider.release(connection);
 				log.warn("Validation of shared connection failed. Creating a new connection.");
 				initConnection();
 			}
@@ -728,9 +761,9 @@ public class LettuceConnectionFactory
 	protected StatefulRedisConnection<byte[], byte[]> createLettuceConnector() {
 		try {
 
-			StatefulRedisConnection<byte[], byte[]> connection = null;
-			if (client instanceof RedisClient) {
-				connection = ((RedisClient) client).connect(LettuceConnection.CODEC);
+			StatefulRedisConnection<byte[], byte[]> connection;
+			if (!isClusterAware()) {
+				connection = connectionProvider.getConnection();
 				if (getDatabase() > 0) {
 					connection.sync().select(getDatabase());
 				}
@@ -743,7 +776,16 @@ public class LettuceConnectionFactory
 		}
 	}
 
-	private AbstractRedisClient createRedisClient() {
+	private LettuceConnectionProvider createConnectionProvider(AbstractRedisClient client, RedisCodec<?, ?> codec) {
+
+		if (isClusterAware()) {
+			return new ClusterConnectionProvider((RedisClusterClient) client, codec);
+		}
+
+		return new StandaloneConnectionProvider((RedisClient) client, codec);
+	}
+
+	private AbstractRedisClient createClient() {
 
 		if (isRedisSentinelAware()) {
 
@@ -767,9 +809,6 @@ public class LettuceConnectionFactory
 					.map(clientResources -> RedisClusterClient.create(clientResources, initialUris)) //
 					.orElseGet(() -> RedisClusterClient.create(initialUris));
 
-			this.clusterCommandExecutor = new ClusterCommandExecutor(new LettuceClusterTopologyProvider(clusterClient),
-					new LettuceClusterConnection.LettuceClusterNodeResourceProvider(clusterClient), EXCEPTION_TRANSLATION);
-
 			clientConfiguration.getClientOptions() //
 					.filter(clientOptions -> clientOptions instanceof ClusterClientOptions) //
 					.ifPresent(clientOptions -> clusterClient.setOptions((ClusterClientOptions) clientOptions));
@@ -777,15 +816,12 @@ public class LettuceConnectionFactory
 			return clusterClient;
 		}
 
-		if (pool != null) {
-			return pool.getClient();
-		}
-
 		RedisURI uri = createRedisURIAndApplySettings(getHostName(), getPort());
 		RedisClient redisClient = clientConfiguration.getClientResources() //
 				.map(clientResources -> RedisClient.create(clientResources, uri)) //
 				.orElseGet(() -> RedisClient.create(uri));
 		clientConfiguration.getClientOptions().ifPresent(redisClient::setOptions);
+
 		return redisClient;
 	}
 
@@ -816,10 +852,11 @@ public class LettuceConnectionFactory
 	@Override
 	public RedisSentinelConnection getSentinelConnection() {
 
-		if (!(client instanceof RedisClient)) {
-			throw new InvalidDataAccessResourceUsageException("Unable to connect to sentinels using " + client.getClass());
+		if (!(connectionProvider instanceof StandaloneConnectionProvider)) {
+			throw new InvalidDataAccessResourceUsageException(
+					"Unable to connect to sentinels using " + connectionProvider.getClass());
 		}
-		return new LettuceSentinelConnection(((RedisClient) client).connectSentinel());
+		return new LettuceSentinelConnection(connectionProvider);
 	}
 
 	private MutableLettuceClientConfiguration getMutableConfiguration() {
