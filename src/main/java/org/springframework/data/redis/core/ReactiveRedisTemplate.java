@@ -293,7 +293,7 @@ public class ReactiveRedisTemplate<K, V> implements ReactiveRedisOperations<K, V
 		ReactiveRedisConnection connToExpose = (exposeConnection ? connToUse : createRedisConnectionProxy(connToUse));
 		Publisher<T> result = action.doInRedis(connToExpose);
 
-		return Flux.from(postProcessResult(result, connToUse, false)).doAfterTerminate(conn::close);
+		return Flux.from(postProcessResult(result, connToUse, false)).doFinally(s -> conn.close());
 	}
 
 	// -------------------------------------------------------------------------
